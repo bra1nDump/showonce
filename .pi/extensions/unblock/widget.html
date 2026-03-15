@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>unblock — voice bridge</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font-family: system-ui; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+    #status { font-size: 1.2em; margin-bottom: 1em; }
+    #controls { margin-bottom: 1em; }
+    #controls button { font-size: 1em; padding: 0.4em 1.2em; border: 1px solid #555; background: #222; color: #eee; border-radius: 6px; cursor: pointer; margin: 0 0.3em; }
+    #controls button:hover { background: #333; }
+    #controls button.active { background: #c33; border-color: #f44; }
+    #pending { max-width: 700px; width: 100%; padding: 0 1em; margin-bottom: 0.5em; }
+    #pending:empty { display: none; }
+    .pending-msg { background: #1a1a2e; border-left: 3px solid #f84; padding: 0.3em 0.6em; margin: 0.2em 0; font-size: 0.85em; color: #ccc; border-radius: 0 4px 4px 0; }
+    .pending-label { font-size: 0.75em; color: #f84; text-transform: uppercase; margin-bottom: 0.2em; }
+    #log { font-size: 0.85em; color: #888; max-height: 50vh; overflow-y: auto; white-space: pre-wrap; max-width: 700px; width: 100%; padding: 0 1em; }
+    .listening { color: #4f4; }
+    .speaking { color: #f84; }
+    .error { color: #f44; }
+    .disconnected { color: #888; }
+    .paused { color: #ff0; }
+  </style>
+</head>
+<body>
+  <div id="status" class="disconnected">loading config...</div>
+  <div id="controls">
+    <button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+  </div>
+  <div id="pending"></div>
+  <div id="log"></div>
+
+  <script type="module">
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const pauseBtn = document.getElementById("pauseBtn");
+    const pendingEl = document.getElementById("pending");
+
+    let paused = false;
+    let currentMode = "listening";
+    let userSpokeInThisTurn = false; // true once user speaks during a "listening" window
+    let relayQueue = [];
+    let drainTimer = null;
+    const DRAIN_DELAY_MS = 2000; // wait this long after mode→listening before draining
+
+    function renderPending() {
+      pendingEl.innerHTML = "";
+      if (relayQueue.length === 0) return;
+      const label = document.createElement("div");
+      label.className = "pending-label";
+      label.textContent = `${relayQueue.length} pending relay message${relayQueue.length > 1 ? "s" : ""}`;
+      pendingEl.appendChild(label);
+      for (const text of relayQueue) {
+        const el = document.createElement("div");
+        el.className = "pending-msg";
+        el.textContent = text.length > 120 ? text.slice(0, 120) + "…" : text;
+        pendingEl.appendChild(el);
+      }
+    }
+
+    function tryDrainQueue() {
+      if (drainTimer) clearTimeout(drainTimer);
+      drainTimer = null;
+      if (relayQueue.length === 0 || !conversation || paused) return;
+      if (currentMode !== "listening" || userSpokeInThisTurn) return;
+      const text = relayQueue.shift();
+      log(`[relay→voice] delivering: "${text.slice(0, 80)}…"`);
+      conversation.sendUserMessage("[PI] " + text);
+      renderPending();
+    }
+
+    function scheduleDrain() {
+      if (drainTimer) clearTimeout(drainTimer);
+      if (relayQueue.length === 0 || currentMode !== "listening" || userSpokeInThisTurn) return;
+      drainTimer = setTimeout(tryDrainQueue, DRAIN_DELAY_MS);
+    }
+
+    function log(msg) {
+      const line = document.createElement("div");
+      line.textContent = `${new Date().toLocaleTimeString()} ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(text, cls) {
+      if (paused) return; // don't override paused status
+      statusEl.textContent = text;
+      statusEl.className = cls;
+    }
+
+    window.togglePause = async function() {
+      if (!paused) {
+        // Pause: mute mic + speaker, keep session alive
+        paused = true;
+        pauseBtn.textContent = "▶ Resume";
+        pauseBtn.classList.add("active");
+        statusEl.textContent = "⏸ paused";
+        statusEl.className = "paused";
+        if (conversation) {
+          try { conversation.setVolume({ volume: 0 }); } catch {}
+          try { conversation.setMicMuted(true); } catch {}
+          log("[pause] muted mic + speaker");
+        }
+      } else {
+        // Resume: unmute
+        paused = false;
+        pauseBtn.textContent = "⏸ Pause";
+        pauseBtn.classList.remove("active");
+        if (conversation) {
+          try { conversation.setVolume({ volume: 1 }); } catch {}
+          try { conversation.setMicMuted(false); } catch {}
+          setStatus(currentMode === "speaking" ? "🔊 speaking" : "🎙️ listening",
+                    currentMode === "speaking" ? "speaking" : "listening");
+          log("[resume] unmuted mic + speaker");
+        } else {
+          // Session was lost while paused, reconnect
+          log("[resume] no session, reconnecting...");
+          reconnectAttempts = 0;
+          start();
+        }
+      }
+    };
+
+    // --- Fetch config from extension ---
+    let config;
+    try {
+      const res = await fetch("/config");
+      config = await res.json();
+      log(`[config] agentId=${config.agentId}, prompt=${config.systemPrompt.length} chars`);
+    } catch (err) {
+      setStatus("failed to load config", "error");
+      log(`[error] ${err.message}`);
+      throw err;
+    }
+
+    // --- WebSocket to extension ---
+    let ws;
+    let conversation;
+    let reconnectAttempts = 0;
+
+    function connectWS() {
+      const wsUrl = `ws://${location.host}/ws`;
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => log("[ws] connected to extension");
+      ws.onclose = () => {
+        log("[ws] disconnected, reconnecting...");
+        setTimeout(connectWS, 2000);
+      };
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+
+        if (data.type === "relay_to_voice") {
+          log(`[pi→voice] queued: "${data.text.slice(0, 80)}…"`);
+          relayQueue.push(data.text);
+          renderPending();
+          scheduleDrain();
+        }
+      };
+    }
+    connectWS();
+
+    // --- 11labs Conversational AI ---
+    const { VoiceConversation } = await import(
+      "https://cdn.jsdelivr.net/npm/@elevenlabs/client@0.15.1/+esm"
+    );
+
+    async function start() {
+      if (!config.agentId) {
+        setStatus("no agentId in config", "error");
+        return;
+      }
+
+      setStatus("connecting to 11labs...", "disconnected");
+
+      try {
+        conversation = await VoiceConversation.startSession({
+          agentId: config.agentId,
+          overrides: config.systemPrompt ? {
+            agent: { prompt: { prompt: config.systemPrompt } }
+          } : undefined,
+
+          clientTools: {
+            send_to_pi: async (params) => {
+              log(`[voice→pi] "${params.message}"`);
+              if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: "send_to_pi",
+                  message: params.message,
+                }));
+              }
+              // Fire and forget — return immediately
+              return "sent";
+            },
+          },
+
+          onConnect: ({ conversationId }) => {
+            log(`[11labs] connected: ${conversationId}`);
+            setStatus("🎙️ listening", "listening");
+            reconnectAttempts = 0;
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "voice_status", status: "connected" }));
+            }
+          },
+          onDisconnect: (details) => {
+            log(`[11labs] disconnected: ${JSON.stringify(details)}`);
+            conversation = null;
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "voice_status", status: "disconnected" }));
+            }
+            // Don't auto-reconnect if user paused
+            if (paused) {
+              log("[11labs] paused by user, not reconnecting");
+              return;
+            }
+            // Don't retry on quota/billing errors
+            const msg = details.message || details.closeReason || "";
+            if (msg.includes("quota") || msg.includes("limit") || msg.includes("billing")) {
+              setStatus("quota exceeded — check ElevenLabs billing", "error");
+              log("[11labs] not reconnecting: quota/billing issue");
+              return;
+            }
+            // Auto-reconnect with backoff for transient errors
+            setStatus("disconnected — reconnecting...", "disconnected");
+            reconnectAttempts++;
+            const delay = Math.min(3000 * reconnectAttempts, 30000);
+            log(`[11labs] will reconnect in ${delay/1000}s (attempt ${reconnectAttempts})`);
+            setTimeout(() => start(), delay);
+          },
+          onModeChange: ({ mode }) => {
+            currentMode = mode;
+            if (mode === "speaking") {
+              // Agent started speaking — means user's turn is over
+              setStatus("🔊 speaking", "speaking");
+              userSpokeInThisTurn = false;
+              if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+            } else {
+              // listening — agent done, new user turn begins
+              setStatus("🎙️ listening", "listening");
+              userSpokeInThisTurn = false;
+              scheduleDrain();
+            }
+          },
+          onMessage: ({ message, role }) => {
+            log(`[${role}] ${message}`);
+            if (role === "user") {
+              // User spoke — don't deliver relay messages this turn
+              userSpokeInThisTurn = true;
+              if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+            }
+          },
+          onError: (error) => {
+            log(`[11labs error] ${typeof error === 'string' ? error : JSON.stringify(error)}`);
+          },
+        });
+      } catch (err) {
+        setStatus(`error: ${err.message}`, "error");
+        log(`[fatal] ${err.message}`);
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>
